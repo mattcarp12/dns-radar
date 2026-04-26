@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  ingress:
+    build:
+      context: .
+      args:
+        APP_CMD: ingress
+    ports:
+      - "6000:6000"
+    environment:
+      - REDIS_ADDR=redis:6379
+    depends_on:
+      - redis
+
+  extractor:
+    build:
+      context: .
+      args:
+        APP_CMD: extractor
+    environment:
+      - REDIS_ADDR=redis:6379
+    depends_on:
+      - redis
