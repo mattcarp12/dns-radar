@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
@@ -33,28 +34,37 @@ func main() {
 func processPcap(filename string, label int) {
 	handle, err := pcap.OpenOffline(filename)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to open pcap: %v", err)
 	}
 	defer handle.Close()
 
-	// Reusing your windowing map
 	activeWindows := make(map[string]*features.Window)
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 
-	log.Printf("Parsing %s...", filename)
+	// Open the CSV file to stream rows continuously, instead of holding all in memory
+	f, err := os.OpenFile("dataset.csv", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatalf("Failed to open CSV: %v", err)
+	}
+	defer f.Close()
+
+	writer := csv.NewWriter(f)
+	defer writer.Flush()
+
+	log.Printf("Parsing %s in 30-second tumbling windows...", filename)
+
+	windowDuration := 30 * time.Second
+	packetCount := 0
 
 	for packet := range packetSource.Packets() {
-		// Extract the DNS layer
 		dnsLayer := packet.Layer(layers.LayerTypeDNS)
 		if dnsLayer != nil {
 			dns, _ := dnsLayer.(*layers.DNS)
 
-			// We only care about queries with questions
 			if len(dns.Questions) == 0 {
 				continue
 			}
 
-			// Extract IP layer for the ClientIP
 			clientIP := "0.0.0.0"
 			if ipLayer := packet.Layer(layers.LayerTypeIPv4); ipLayer != nil {
 				ip, _ := ipLayer.(*layers.IPv4)
@@ -65,57 +75,74 @@ func processPcap(filename string, label int) {
 			rootDomain := features.ExtractRootDomain(domain)
 			key := rootDomain + "|" + clientIP
 
+			// Use the actual time the packet was recorded on the wire
+			packetTime := packet.Metadata().Timestamp
+
 			logEvent := parser.DnsLog{
-				Timestamp: packet.Metadata().Timestamp,
+				Timestamp: packetTime,
 				ClientIP:  clientIP,
 				Domain:    domain,
 				QueryType: dns.Questions[0].Type.String(),
 			}
 
-			// Add to window
+			// Define a threshold for how many queries make a "full" window
+			maxEventsPerWindow := 50
+
 			if win, exists := activeWindows[key]; exists {
-				win.Events = append(win.Events, logEvent)
+				// HYBRID TRIGGER: Close if 30s have passed OR if we hit 50 queries
+				if packetTime.Sub(win.StartedAt) >= windowDuration || len(win.Events) >= maxEventsPerWindow {
+					writeSingleWindow(writer, win, label)
+
+					// Start a fresh window
+					activeWindows[key] = &features.Window{
+						Domain:    rootDomain,
+						ClientIP:  clientIP,
+						StartedAt: packetTime,
+						Events:    []parser.DnsLog{logEvent},
+					}
+				} else {
+					// Still within limits
+					win.Events = append(win.Events, logEvent)
+				}
 			} else {
+				// First time seeing this domain/IP combo
 				activeWindows[key] = &features.Window{
 					Domain:    rootDomain,
 					ClientIP:  clientIP,
-					StartedAt: packet.Metadata().Timestamp,
+					StartedAt: packetTime,
 					Events:    []parser.DnsLog{logEvent},
 				}
 			}
+			packetCount++
 		}
 	}
 
-	// Once the PCAP is fully read, flush all windows to the CSV
-	writeToCSV(activeWindows, label)
+	// Flush whatever is left in memory at the end of the file
+	for _, win := range activeWindows {
+		writeSingleWindow(writer, win, label)
+	}
+
+	log.Printf("Finished processing %d DNS packets from %s", packetCount, filename)
 }
 
-func writeToCSV(windows map[string]*features.Window, label int) {
-	f, _ := os.OpenFile("dataset.csv", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	defer f.Close()
-	writer := csv.NewWriter(f)
-	defer writer.Flush()
+func writeSingleWindow(writer *csv.Writer, win *features.Window, label int) {
+	// We still only care about windows with enough traffic to form a pattern
+	if len(win.Events) >= 2 {
+		fv := features.Extract(*win)
 
-	for _, win := range windows {
-		// Only process windows that have enough data to be meaningful
-		if len(win.Events) > 5 {
-			fv := features.Extract(*win)
-
-			record := []string{
-				fv.Domain,
-				fmt.Sprintf("%f", fv.ShannonEntropy),
-				fmt.Sprintf("%d", fv.MaxSubdomainLen),
-				fmt.Sprintf("%f", fv.AvgSubdomainLen),
-				fmt.Sprintf("%f", fv.UnigramDeviation),
-				fmt.Sprintf("%f", fv.BigramEntropy),
-				fmt.Sprintf("%f", fv.NXDomainRatio),
-				fmt.Sprintf("%d", fv.UniqueSubdomains),
-				fmt.Sprintf("%f", fv.TXTRatio),
-				fmt.Sprintf("%f", fv.Burstiness),
-				fmt.Sprintf("%d", label),
-			}
-			writer.Write(record)
+		record := []string{
+			fv.Domain,
+			fmt.Sprintf("%f", fv.ShannonEntropy),
+			fmt.Sprintf("%d", fv.MaxSubdomainLen),
+			fmt.Sprintf("%f", fv.AvgSubdomainLen),
+			fmt.Sprintf("%f", fv.UnigramDeviation),
+			fmt.Sprintf("%f", fv.BigramEntropy),
+			fmt.Sprintf("%f", fv.NXDomainRatio),
+			fmt.Sprintf("%d", fv.UniqueSubdomains),
+			fmt.Sprintf("%f", fv.TXTRatio),
+			fmt.Sprintf("%f", fv.Burstiness),
+			fmt.Sprintf("%d", label),
 		}
+		writer.Write(record)
 	}
-	log.Printf("Successfully appended features to dataset.csv")
 }
