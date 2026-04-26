@@ -12,7 +12,8 @@ try:
     print("Model loaded successfully.")
 except Exception as e:
     print(f"Failed to load model: {e}")
-    model = None
+    print("The server cannot function without the model. Exiting.")
+    exit(1)  # Exit if model can't be loaded, since the server can't function without it
 
 # 2. Define the expected JSON payload (Matches Go FeatureVector perfectly)
 
